@@ -236,45 +236,64 @@ jobs:
       # Create RDP account
       - name: Create RDP User
         shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $chars = (
-            'ABCDEFGHJKLMNPQRSTUVWXYZ' +
-            'abcdefghijkmnopqrstuvwxyz' +
-            '23456789' +
-            '!@#$%^&*()-_=+'
-          ).ToCharArray()
+          if ($env:RDP_PASSWORD) {
+            $password = $env:RDP_PASSWORD
+            $showPassword = $false
+            Write-Host "Using configured RDP password from GitHub Secret."
+          } else {
+            $chars = (
+              'ABCDEFGHJKLMNPQRSTUVWXYZ' +
+              'abcdefghijkmnopqrstuvwxyz' +
+              '23456789' +
+              '!@#$%^&*()-_=+'
+            ).ToCharArray()
 
-          $password = -join (
-            1..24 | ForEach-Object {
-              $chars[(Get-Random -Maximum $chars.Length)]
-            }
-          )
+            $password = -join (
+              1..24 | ForEach-Object {
+                $chars[(Get-Random -Maximum $chars.Length)]
+              }
+            )
+
+            $showPassword = $true
+            Write-Host "No RDP_PASSWORD secret found. Generated a new password."
+          }
 
           $securePass = ConvertTo-SecureString `
             $password -AsPlainText -Force
 
-          New-LocalUser `
-            -Name "RDP" `
-            -Password $securePass `
-            -AccountNeverExpires
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+            New-LocalUser `
+              -Name "RDP" `
+              -Password $securePass `
+              -AccountNeverExpires
+          }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member "RDP"
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member "RDP"
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
 
-          # Mask password in workflow logs
-          Write-Output "::add-mask::$password"
+          if ($showPassword) {
+            Write-Output "::add-mask::$password"
+            "RDP_GENERATED_PASSWORD=$password" >> $env:GITHUB_ENV
+          }
 
           @"
           ## RDP ACCESS
 
           Address: $env:TAILSCALE_IP
           Username: RDP
-          Password: $password
+          Password: $(if ($showPassword) { $password } else { '[Stored in GitHub Secret]' })
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
       # Verify RDP connection
@@ -367,7 +386,7 @@ jobs:
         with:
           path: ${{ runner.temp }}\tailscale-cache
           key: tailscale-state-${{ github.run_id }}
-
+      
       # Maintain RDP connection
       - name: Maintain Connection
         shell: pwsh
@@ -376,6 +395,11 @@ jobs:
           Write-Host "========== RDP ACTIVE =========="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
+
+          if ($env:RDP_GENERATED_PASSWORD) {
+            Write-Host "Password: $env:RDP_GENERATED_PASSWORD"
+          }
+
           Write-Host "================================"
 
           while ($true) {
