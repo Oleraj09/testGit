@@ -141,7 +141,7 @@ jobs:
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILESCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
@@ -154,7 +154,7 @@ jobs:
           } else {
 
             if (-not $env:TAILSCALE_AUTH_KEY) {
-              throw "TAILSCALE_AUTH_KEY is missing."
+              throw "TAILESCALE_AUTH_KEY is missing."
             }
 
             & $ts up `
