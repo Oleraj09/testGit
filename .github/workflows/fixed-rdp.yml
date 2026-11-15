@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
+
       # Restore previous encrypted Tailscale identity
       - name: Restore Tailscale State
         uses: actions/cache/restore@v4
@@ -54,13 +55,17 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
-          Start-Process msiexec.exe `
+          $process = Start-Process msiexec.exe `
             -ArgumentList "/i `"$installer`" /quiet /norestart" `
-            -Wait
+            -Wait -PassThru
 
           Remove-Item $installer -Force
 
-      # Restore previous node identity
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+      # Restore previous Tailscale identity
       - name: Restore Tailscale Identity
         shell: pwsh
         env:
@@ -94,7 +99,12 @@ jobs:
               throw "TAILSCALE_STATE_KEY is missing."
             }
 
-            $key = [Convert]::FromBase64String($env:STATE_KEY)
+            try {
+              $key = [Convert]::FromBase64String($env:STATE_KEY)
+            }
+            catch {
+              throw "TAILSCALE_STATE_KEY is not valid Base64."
+            }
 
             if ($key.Length -ne 32) {
               throw "STATE_KEY must decode to exactly 32 bytes."
@@ -141,13 +151,17 @@ jobs:
           Start-Service -Name Tailscale
           Start-Sleep -Seconds 5
 
-      # Connect using the saved identity or auth key
+      # Establish Tailscale connection
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILESCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
 
           if ($env:TS_STATE_RESTORED -eq "true") {
 
@@ -196,7 +210,6 @@ jobs:
 
           Write-Host "Tailscale IP: $tsIP"
 
-      
       # Configure Windows RDP
       - name: Configure RDP
         shell: pwsh
@@ -207,19 +220,19 @@ jobs:
             -Name fDenyTSConnections `
             -Value 0
 
-          # Disable Network Level Authentication (NLA)
+          # Disable Network Level Authentication
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication `
             -Value 0
 
-          # Use TLS security layer while allowing non-NLA connections
+          # Use TLS security layer
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name SecurityLayer `
             -Value 1
 
-          # Allow RDP only through Tailscale
+          # Restrict RDP to Tailscale network
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Disable-NetFirewallRule
 
@@ -240,6 +253,7 @@ jobs:
 
           Restart-Service -Name TermService -Force
 
+          Write-Host "RDP configured successfully."
 
       # Create RDP account
       - name: Create RDP User
@@ -247,11 +261,15 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ($env:RDP_PASSWORD) {
+          if (-not [string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
+
             $password = $env:RDP_PASSWORD
             $showPassword = $false
+
             Write-Host "Using configured RDP password from GitHub Secret."
+
           } else {
+
             $chars = (
               'ABCDEFGHJKLMNPQRSTUVWXYZ' +
               'abcdefghijkmnopqrstuvwxyz' +
@@ -266,15 +284,24 @@ jobs:
             )
 
             $showPassword = $true
+
             Write-Host "No RDP_PASSWORD secret found. Generated a new password."
           }
 
           $securePass = ConvertTo-SecureString `
             $password -AsPlainText -Force
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+          $existingUser = Get-LocalUser `
+            -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
             Set-LocalUser -Name "RDP" -Password $securePass
+            Enable-LocalUser -Name "RDP"
+
           } else {
+
             New-LocalUser `
               -Name "RDP" `
               -Password $securePass `
@@ -292,9 +319,17 @@ jobs:
             -ErrorAction SilentlyContinue
 
           if ($showPassword) {
-            Write-Output "::add-mask::$password"
             "RDP_GENERATED_PASSWORD=$password" >> $env:GITHUB_ENV
           }
+
+          $user = Get-LocalUser -Name "RDP"
+
+          if (-not $user.Enabled) {
+            throw "RDP account is disabled."
+          }
+
+          Write-Host "RDP account created/configured successfully."
+          Write-Host "RDP account enabled: $($user.Enabled)"
 
           @"
           ## RDP ACCESS
@@ -312,7 +347,8 @@ jobs:
 
           $result = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
-            -Port 3389
+            -Port 3389 `
+            -WarningAction SilentlyContinue
 
           if (-not $result.TcpTestSucceeded) {
             throw "RDP connection test failed."
@@ -345,7 +381,12 @@ jobs:
             throw "TAILSCALE_STATE_KEY is missing."
           }
 
-          $key = [Convert]::FromBase64String($env:STATE_KEY)
+          try {
+            $key = [Convert]::FromBase64String($env:STATE_KEY)
+          }
+          catch {
+            throw "TAILSCALE_STATE_KEY is not valid Base64."
+          }
 
           if ($key.Length -ne 32) {
             throw "Invalid state encryption key."
@@ -388,13 +429,13 @@ jobs:
 
           Write-Host "Encrypted Tailscale identity saved."
 
-      # Save cache for next workflow run
+      # Persist Tailscale state
       - name: Persist Tailscale State
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}\tailscale-cache
           key: tailscale-state-${{ github.run_id }}
-      
+
       # Maintain RDP connection
       - name: Maintain Connection
         shell: pwsh
