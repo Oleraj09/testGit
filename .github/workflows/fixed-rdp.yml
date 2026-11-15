@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # Restore the previous encrypted Tailscale identity
+      # Restore previous encrypted Tailscale identity
       - name: Restore Tailscale State
         uses: actions/cache/restore@v4
         with:
@@ -60,7 +60,7 @@ jobs:
 
           Remove-Item $installer -Force
 
-      # Restore the previous node identity
+      # Restore previous node identity
       - name: Restore Tailscale Identity
         shell: pwsh
         env:
@@ -89,6 +89,10 @@ jobs:
           if (Test-Path $cacheFile) {
 
             Write-Host "Previous Tailscale identity found. Restoring..."
+
+            if (-not $env:STATE_KEY) {
+              throw "TAILSCALE_STATE_KEY is missing."
+            }
 
             $key = [Convert]::FromBase64String($env:STATE_KEY)
 
@@ -137,7 +141,7 @@ jobs:
           Start-Service -Name Tailscale
           Start-Sleep -Seconds 5
 
-      # Connect to the same Tailscale node
+      # Connect using the saved identity or auth key
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
@@ -147,11 +151,15 @@ jobs:
 
           if ($env:TS_STATE_RESTORED -eq "true") {
 
+            Write-Host "Connecting with restored identity..."
+
             & $ts up `
               --hostname=gh-runner-rdp `
               --unattended
 
           } else {
+
+            Write-Host "Registering new Tailscale identity..."
 
             if (-not $env:TAILSCALE_AUTH_KEY) {
               throw "TAILESCALE_AUTH_KEY is missing."
@@ -197,7 +205,7 @@ jobs:
             -Name fDenyTSConnections `
             -Value 0
 
-          # Keep Network Level Authentication enabled
+          # Enable Network Level Authentication
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication `
@@ -208,7 +216,7 @@ jobs:
             -Name SecurityLayer `
             -Value 2
 
-          # Restrict RDP to Tailscale addresses
+          # Restrict RDP access to Tailscale network
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Disable-NetFirewallRule
 
@@ -258,6 +266,9 @@ jobs:
             -Group "Remote Desktop Users" `
             -Member "RDP"
 
+          # Mask password in workflow logs
+          Write-Output "::add-mask::$password"
+
           @"
           ## RDP ACCESS
 
@@ -266,7 +277,7 @@ jobs:
           Password: $password
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
-      # Verify connection
+      # Verify RDP connection
       - name: Verify RDP
         shell: pwsh
         run: |
@@ -282,7 +293,7 @@ jobs:
 
           Write-Host "RDP connection successful!"
 
-      # Encrypt and save the updated Tailscale identity
+      # Encrypt and save Tailscale identity
       - name: Save Tailscale Identity
         shell: pwsh
         env:
@@ -301,6 +312,10 @@ jobs:
 
           if (-not $stateFile) {
             throw "Tailscale state file not found."
+          }
+
+          if (-not $env:STATE_KEY) {
+            throw "TAILSCALE_STATE_KEY is missing."
           }
 
           $key = [Convert]::FromBase64String($env:STATE_KEY)
@@ -346,13 +361,14 @@ jobs:
 
           Write-Host "Encrypted Tailscale identity saved."
 
+      # Save cache for next workflow run
       - name: Persist Tailscale State
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}\tailscale-cache
           key: tailscale-state-${{ github.run_id }}
 
-      # Keep RDP active
+      # Maintain RDP connection
       - name: Maintain Connection
         shell: pwsh
         run: |
