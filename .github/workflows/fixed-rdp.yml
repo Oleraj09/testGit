@@ -196,29 +196,36 @@ jobs:
 
           Write-Host "Tailscale IP: $tsIP"
 
+      
       # Configure Windows RDP
       - name: Configure RDP
         shell: pwsh
         run: |
+          # Enable Remote Desktop
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections `
             -Value 0
 
-          # Enable Network Level Authentication
+          # Disable Network Level Authentication (NLA)
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication `
-            -Value 1
+            -Value 0
 
+          # Use TLS security layer while allowing non-NLA connections
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name SecurityLayer `
-            -Value 2
+            -Value 1
 
-          # Restrict RDP access to Tailscale network
+          # Allow RDP only through Tailscale
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Disable-NetFirewallRule
+
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
 
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale-Only" `
@@ -232,6 +239,7 @@ jobs:
           Set-Service -Name TermService -StartupType Automatic
 
           Restart-Service -Name TermService -Force
+
 
       # Create RDP account
       - name: Create RDP User
