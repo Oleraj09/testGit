@@ -1,0 +1,368 @@
+
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tailscale-rdp-fixed-node
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # Restore the previous encrypted Tailscale identity
+      - name: Restore Tailscale State
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}\tailscale-cache
+          key: tailscale-state-${{ github.run_id }}
+          restore-keys: |
+            tailscale-state-
+
+      # Configure portable Tailscale state
+      - name: Configure Tailscale State Policy
+        shell: pwsh
+        run: |
+          $policy = "HKLM:\SOFTWARE\Policies\Tailscale"
+
+          New-Item -Path $policy -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $policy `
+            -Name EncryptState `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          New-Item -ItemType Directory `
+            -Path "$env:RUNNER_TEMP\tailscale-cache" `
+            -Force | Out-Null
+
+      # Install Tailscale
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+      # Restore the previous node identity
+      - name: Restore Tailscale Identity
+        shell: pwsh
+        env:
+          STATE_KEY: ${{ secrets.TAILSCALE_STATE_KEY }}
+        run: |
+          $stateDir = "$env:ProgramData\Tailscale"
+          $cacheFile = "$env:RUNNER_TEMP\tailscale-cache\tailscale-state.enc"
+
+          New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+
+          Stop-Service -Name Tailscale -Force -ErrorAction SilentlyContinue
+
+          $candidates = @(
+            "$stateDir\tailscaled.state",
+            "$stateDir\server-state.conf"
+          )
+
+          $stateFile = $candidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $stateFile) {
+            $stateFile = $candidates[0]
+          }
+
+          if (Test-Path $cacheFile) {
+
+            Write-Host "Previous Tailscale identity found. Restoring..."
+
+            $key = [Convert]::FromBase64String($env:STATE_KEY)
+
+            if ($key.Length -ne 32) {
+              throw "STATE_KEY must decode to exactly 32 bytes."
+            }
+
+            $data = [IO.File]::ReadAllBytes($cacheFile)
+
+            if ($data.Length -lt 29) {
+              throw "Invalid encrypted Tailscale state."
+            }
+
+            $nonce = New-Object byte[] 12
+            $tag = New-Object byte[] 16
+            $cipher = New-Object byte[] ($data.Length - 28)
+
+            [Buffer]::BlockCopy($data, 0, $nonce, 0, 12)
+            [Buffer]::BlockCopy($data, 12, $tag, 0, 16)
+            [Buffer]::BlockCopy($data, 28, $cipher, 0, $cipher.Length)
+
+            $plain = New-Object byte[] $cipher.Length
+
+            $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+
+            try {
+              $aes.Decrypt($nonce, $cipher, $tag, $plain)
+            }
+            finally {
+              $aes.Dispose()
+            }
+
+            [IO.File]::WriteAllBytes($stateFile, $plain)
+
+            "TS_STATE_RESTORED=true" >> $env:GITHUB_ENV
+
+            Write-Host "Tailscale identity restored."
+
+          } else {
+
+            Write-Host "No previous identity found. First-time registration."
+
+            "TS_STATE_RESTORED=false" >> $env:GITHUB_ENV
+          }
+
+          Start-Service -Name Tailscale
+          Start-Sleep -Seconds 5
+
+      # Connect to the same Tailscale node
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if ($env:TS_STATE_RESTORED -eq "true") {
+
+            & $ts up `
+              --hostname=gh-runner-rdp `
+              --unattended
+
+          } else {
+
+            if (-not $env:TAILSCALE_AUTH_KEY) {
+              throw "TAILSCALE_AUTH_KEY is missing."
+            }
+
+            & $ts up `
+              "--authkey=$env:TAILSCALE_AUTH_KEY" `
+              --hostname=gh-runner-rdp `
+              --unattended
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+
+            $tsIP = (& $ts ip -4 | Select-Object -First 1).Trim()
+
+            if ($tsIP -match '^100\.') {
+              break
+            }
+
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $tsIP -or $tsIP -notmatch '^100\.') {
+            throw "Tailscale IP assignment failed."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      # Configure Windows RDP
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections `
+            -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication `
+            -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name SecurityLayer `
+            -Value 2
+
+          # Restrict RDP to Tailscale addresses
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress 100.64.0.0/10 `
+            -Action Allow `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+
+          Restart-Service -Name TermService -Force
+
+      # Create RDP account
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $chars = (
+            'ABCDEFGHJKLMNPQRSTUVWXYZ' +
+            'abcdefghijkmnopqrstuvwxyz' +
+            '23456789' +
+            '!@#$%^&*()-_=+'
+          ).ToCharArray()
+
+          $password = -join (
+            1..24 | ForEach-Object {
+              $chars[(Get-Random -Maximum $chars.Length)]
+            }
+          )
+
+          $securePass = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          @"
+          ## RDP ACCESS
+
+          Address: $env:TAILSCALE_IP
+          Username: RDP
+          Password: $password
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      # Verify connection
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          Write-Host "Testing RDP connection..."
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+            throw "RDP connection test failed."
+          }
+
+          Write-Host "RDP connection successful!"
+
+      # Encrypt and save the updated Tailscale identity
+      - name: Save Tailscale Identity
+        shell: pwsh
+        env:
+          STATE_KEY: ${{ secrets.TAILSCALE_STATE_KEY }}
+        run: |
+          $stateDir = "$env:ProgramData\Tailscale"
+
+          $candidates = @(
+            "$stateDir\tailscaled.state",
+            "$stateDir\server-state.conf"
+          )
+
+          $stateFile = $candidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $stateFile) {
+            throw "Tailscale state file not found."
+          }
+
+          $key = [Convert]::FromBase64String($env:STATE_KEY)
+
+          if ($key.Length -ne 32) {
+            throw "Invalid state encryption key."
+          }
+
+          Start-Sleep -Seconds 3
+
+          $plain = [IO.File]::ReadAllBytes($stateFile)
+
+          $nonce = New-Object byte[] 12
+          $tag = New-Object byte[] 16
+          $cipher = New-Object byte[] $plain.Length
+
+          [Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
+
+          $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+
+          try {
+            $aes.Encrypt($nonce, $plain, $cipher, $tag)
+          }
+          finally {
+            $aes.Dispose()
+          }
+
+          $output = New-Object byte[] (28 + $cipher.Length)
+
+          [Buffer]::BlockCopy($nonce, 0, $output, 0, 12)
+          [Buffer]::BlockCopy($tag, 0, $output, 12, 16)
+          [Buffer]::BlockCopy($cipher, 0, $output, 28, $cipher.Length)
+
+          $cacheDir = "$env:RUNNER_TEMP\tailscale-cache"
+
+          New-Item -ItemType Directory -Path $cacheDir -Force |
+            Out-Null
+
+          [IO.File]::WriteAllBytes(
+            "$cacheDir\tailscale-state.enc",
+            $output
+          )
+
+          Write-Host "Encrypted Tailscale identity saved."
+
+      - name: Persist Tailscale State
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}\tailscale-cache
+          key: tailscale-state-${{ github.run_id }}
+
+      # Keep RDP active
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========== RDP ACTIVE =========="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "================================"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP is active."
+            Start-Sleep -Seconds 300
+          }
