@@ -23,18 +23,20 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}\tailscale-cache
-          key: tailscale-state-${{ github.run_id }}
+          key: tailscale-user-state-${{ github.run_id }}
           restore-keys: |
-            tailscale-state-
+            tailscale-user-state-
 
-      # Configure portable Tailscale state
-      - name: Configure Tailscale State Policy
+      # Configure Tailscale state and user-mode policies
+      - name: Configure Tailscale Policies
         shell: pwsh
         run: |
           $policy = "HKLM:\SOFTWARE\Policies\Tailscale"
 
           New-Item -Path $policy -Force | Out-Null
 
+          # Disable TPM-based state encryption because
+          # GitHub-hosted runners use different machines.
           New-ItemProperty `
             -Path $policy `
             -Name EncryptState `
@@ -42,9 +44,19 @@ jobs:
             -Value 0 `
             -Force | Out-Null
 
+          # Prevent Windows unattended/server mode.
+          New-ItemProperty `
+            -Path $policy `
+            -Name UnattendedMode `
+            -PropertyType String `
+            -Value "never" `
+            -Force | Out-Null
+
           New-Item -ItemType Directory `
             -Path "$env:RUNNER_TEMP\tailscale-cache" `
             -Force | Out-Null
+
+          Write-Host "Tailscale policies configured."
 
       # Install Tailscale
       - name: Install Tailscale
@@ -73,23 +85,11 @@ jobs:
         run: |
           $stateDir = "$env:ProgramData\Tailscale"
           $cacheFile = "$env:RUNNER_TEMP\tailscale-cache\tailscale-state.enc"
+          $stateFile = "$stateDir\tailscaled.state"
 
           New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
           Stop-Service -Name Tailscale -Force -ErrorAction SilentlyContinue
-
-          $candidates = @(
-            "$stateDir\tailscaled.state",
-            "$stateDir\server-state.conf"
-          )
-
-          $stateFile = $candidates |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
-
-          if (-not $stateFile) {
-            $stateFile = $candidates[0]
-          }
 
           if (Test-Path $cacheFile) {
 
@@ -148,8 +148,11 @@ jobs:
             "TS_STATE_RESTORED=false" >> $env:GITHUB_ENV
           }
 
+          # Ensure policy is applied before starting the daemon.
           Start-Service -Name Tailscale
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 8
+
+          Get-Service -Name Tailscale
 
       # Establish Tailscale connection
       - name: Establish Tailscale Connection
@@ -163,13 +166,18 @@ jobs:
             throw "Tailscale executable not found."
           }
 
+          Write-Host "Windows account:"
+          whoami
+
+          Write-Host "Tailscale system policy:"
+          & $ts syspolicy list
+
           if ($env:TS_STATE_RESTORED -eq "true") {
 
             Write-Host "Connecting with restored identity..."
 
             & $ts up `
-              --hostname=gh-runner-rdp `
-              --unattended
+              --hostname=gh-runner-rdp
 
           } else {
 
@@ -181,8 +189,7 @@ jobs:
 
             & $ts up `
               "--authkey=$env:TAILSCALE_AUTH_KEY" `
-              --hostname=gh-runner-rdp `
-              --unattended
+              --hostname=gh-runner-rdp
           }
 
           if ($LASTEXITCODE -ne 0) {
@@ -193,7 +200,11 @@ jobs:
 
           for ($i = 0; $i -lt 30; $i++) {
 
-            $tsIP = (& $ts ip -4 | Select-Object -First 1).Trim()
+            $ipOutput = & $ts ip -4
+
+            if ($LASTEXITCODE -eq 0) {
+              $tsIP = ($ipOutput | Select-Object -First 1).Trim()
+            }
 
             if ($tsIP -match '^100\.') {
               break
@@ -209,6 +220,9 @@ jobs:
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
           Write-Host "Tailscale IP: $tsIP"
+
+          Write-Host "Final Tailscale status:"
+          & $ts status
 
       # Configure Windows RDP
       - name: Configure RDP
@@ -232,14 +246,16 @@ jobs:
             -Name SecurityLayer `
             -Value 1
 
-          # Restrict RDP to Tailscale network
+          # Disable default Remote Desktop firewall rules
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
             Disable-NetFirewallRule
 
+          # Remove previous custom rule
           Get-NetFirewallRule -DisplayName "RDP-Tailscale-Only" `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
+          # Allow RDP only through Tailscale IP range
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale-Only" `
             -Direction Inbound `
@@ -363,17 +379,9 @@ jobs:
           STATE_KEY: ${{ secrets.TAILSCALE_STATE_KEY }}
         run: |
           $stateDir = "$env:ProgramData\Tailscale"
+          $stateFile = "$stateDir\tailscaled.state"
 
-          $candidates = @(
-            "$stateDir\tailscaled.state",
-            "$stateDir\server-state.conf"
-          )
-
-          $stateFile = $candidates |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
-
-          if (-not $stateFile) {
+          if (-not (Test-Path $stateFile)) {
             throw "Tailscale state file not found."
           }
 
@@ -434,7 +442,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}\tailscale-cache
-          key: tailscale-state-${{ github.run_id }}
+          key: tailscale-user-state-${{ github.run_id }}
 
       # Maintain RDP connection
       - name: Maintain Connection
